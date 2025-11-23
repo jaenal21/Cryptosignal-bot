@@ -1,40 +1,217 @@
+# main.py – Crypto MACD Cross Signal Bot (Render.com 100% Working)
 import os
-import threading
 import time
+import threading
+import logging
 from datetime import datetime, timezone
 
-import ccxt
-import matplotlib
-matplotlib.use("Agg")  # backend non-GUI untuk server
-import matplotlib.pyplot as plt
 import pandas as pd
 import pandas_ta as ta
-from flask import Flask, request
-
+import ccxt
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import telebot
-from telebot import types
+from flask import Flask
 
-# =========================
-#  CONFIG ENV
-# =========================
-# Wajib kamu set di Render:
-#  - TELEGRAM_TOKEN
-#  - WEBHOOK_HOST (misal: https://nama-service.onrender.com)
-#  - OPTIONAL: WEBHOOK_PATH (kalau mau custom, default /webhook/<TOKEN>)
+# ====================== LOGGING ======================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# ====================== CONFIG ======================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TOKEN:
-    raise ValueError("Env TELEGRAM_TOKEN belum di-set.")
+    raise ValueError("Set environment variable: TELEGRAM_TOKEN")
 
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
-if not WEBHOOK_HOST:
-    raise ValueError("Env WEBHOOK_HOST belum di-set. Contoh: https://nama-service.onrender.com")
+bot = telebot.TeleBot(TOKEN)
+USER_CHAT_ID = None
 
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/webhook/{TOKEN}")
-WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
+# ====================== FLASK (Render.com) ======================
+app = Flask(__name__)
+@app.route("/")
+def home():
+    return "Crypto MACD Bot Running!"
 
-PORT = int(os.environ.get("PORT", 8080))  # Render akan isi PORT
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+# ====================== BINANCE ======================
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'timeout': 30000,
+})
+
+PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "PAXG/USDT", "DOT/USDT"]
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
+
+LAST_SIGNAL = {}   # (symbol, tf) -> "BUY"/"SELL"
+
+# ====================== UTIL ======================
+def utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def send(text):
+    global USER_CHAT_ID
+    if USER_CHAT_ID:
+        try:
+            bot.send_message(USER_CHAT_ID, text, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Gagal kirim Telegram: {e}")
+
+# ====================== MACD CROSS DETECTION ======================
+def check_macd_cross(symbol, tf):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+        if len(ohlcv) < 50:
+            return None
+
+        df = pd.DataFrame(ohlcv, columns=["ts", "o", "h", "l", "c", "v"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms")
+        macd = ta.macd(df["c"])
+        if macd is None or macd.empty:
+            return None
+
+        df["macd"] = macd["MACD_12_26_9"]
+        df["signal"] = macd["MACDs_12_26_9"]
+        df["hist"] = macd["MACDh_12_26_9"]
+
+        prev = df.iloc[-2]
+        curr = df.iloc[-1]
+
+        key = (symbol, tf)
+        last = LAST_SIGNAL.get(key)
+
+        # Golden Cross
+        if prev["macd"] <= prev["signal"] and curr["macd"] > curr["signal"]:
+            if last != "BUY":
+                LAST_SIGNAL[key] = "BUY"
+                msg = (
+                    f"*MACD GOLDEN CROSS*\n\n"
+                    f"*Pair:* `{symbol}`\n"
+                    f"*TF:* `{tf}`\n"
+                    f"*Signal:* BUY\n\n"
+                    f"Price: `{curr['c']:.6f}`\n"
+                    f"MACD: `{curr['macd']:.6f}`\n"
+                    f"Signal Line: `{curr['signal']:.6f}`\n"
+                    f"Histogram: `{curr['hist']:.6f}`\n"
+                    f"Time: `{curr['date'].strftime('%Y-%m-%d %H:%M')} UTC`"
+                )
+                return msg
+
+        # Death Cross
+        elif prev["macd"] >= prev["signal"] and curr["macd"] < curr["signal"]:
+            if last != "SELL":
+                LAST_SIGNAL[key] = "SELL"
+                msg = (
+                    f"*MACD DEATH CROSS*\n\n"
+                    f"*Pair:* `{symbol}`\n"
+                    f"*TF:* `{tf}`\n"
+                    f"*Signal:* SELL\n\n"
+                    f"Price: `{curr['c']:.6f}`\n"
+                    f"MACD: `{curr['macd']:.6f}`\n"
+                    f"Signal Line: `{curr['signal']:.6f}`\n"
+                    f"Histogram: `{curr['hist']:.6f}`\n"
+                    f"Time: `{curr['date'].strftime('%Y-%m-%d %H:%M')} UTC`"
+                )
+                return msg
+    except Exception as e:
+        logger.warning(f"Error {symbol} {tf}: {e}")
+    return None
+
+# ====================== SCANNER LOOP ======================
+def scanner():
+    logger.info("Scanner started")
+    while True:
+        try:
+            for symbol in PAIRS:
+                for tf in TIMEFRAMES:
+                    msg = check_macd_cross(symbol, tf)
+                    if msg:
+                        send(msg)
+                    time.sleep(0.7)
+            logger.info(f"Scan complete – {utc_now()}")
+            time.sleep(45)
+        except Exception as e:
+            logger.error(f"Scanner crash: {e}")
+            time.sleep(60)
+
+# ====================== CHART /tf ======================
+def make_chart(symbol, tf):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=150)
+        df = pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms")
+        macd = ta.macd(df["c"])
+        df["macd"] = macd["MACD_12_26_9"]
+        df["signal"] = macd["MACDs_12_26_9"]
+        df["hist"] = macd["MACDh_12_26_9"]
+
+        plt.figure(figsize=(12,8))
+        plt.subplot(2,1,1)
+        plt.plot(df["date"], df["c"], color="#8b5cf6")
+        plt.title(f"{symbol} {tf} – Price")
+        plt.grid(alpha=0.3)
+
+        plt.subplot(2,1,2)
+        plt.plot(df["date"], df["macd"], label="MACD", color="blue")
+        plt.plot(df["date"], df["signal"], label="Signal", color="orange")
+        plt.bar(df["date"], df["hist"], label="Histogram", color="gray", alpha=0.6, width=0.001)
+        plt.axhline(0, color="white", linewidth=0.8, linestyle="--")
+        plt.legend()
+        plt.title("MACD (12,26,9)")
+        plt.grid(alpha=0.3)
+
+        plt.tight_layout()
+        path = f"/tmp/chart_{symbol.replace('/', '')}_{tf}.png"
+        plt.savefig(path, dpi=200)
+        plt.close()
+        return path
+    except:
+        return None
+
+# ====================== TELEGRAM HANDLERS ======================
+@bot.message_handler(commands=["start"])
+def start(msg):
+    global USER_CHAT_ID
+    USER_CHAT_ID = msg.chat.id
+    text = (
+        "*Crypto MACD Cross Signal Bot*\n\n"
+        "Bot akan kirim notif hanya saat terjadi:\n"
+        "• Golden Cross → BUY\n"
+        "• Death Cross → SELL\n\n"
+        f"Pair: {', '.join(PAIRS)}\n"
+        f"TF: {', '.join(TIMEFRAMES)}\n\n"
+        "Chart manual: `/tf 1h BTCUSDT`"
+    )
+    bot.send_message(msg.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=["tf"])
+def chart(msg):
+    try:
+        parts = msg.text.split()
+        if len(parts) != 3:
+            bot.reply_to(msg, "Gunakan: `/tf 1h BTCUSDT`", parse_mode="Markdown")
+            return
+        tf = parts[1].lower()
+        sym = parts[2].upper().replace("USDT", "/USDT")
+        bot.reply_to(msg, f"Mengambil {sym} {tf}...")
+        path = make_chart(sym, tf)
+        if path and os.path.exists(path):
+            with open(path, "rb") as p:
+                bot.send_photo(msg.chat.id, p, caption=f"{sym} – {tf}")
+            os.remove(path)
+        else:
+            bot.reply_to(msg, "Gagal buat chart.")
+    except Exception as e:
+        bot.reply_to(msg, f"Error: {e}")
+
+# ====================== MAIN ======================
+if __name__ == "__main__":
+    logger.info("Bot starting...")
+    threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=scanner, daemon=True).start()
+    bot.infinity_polling(none_stop=True, interval=0, timeout=60)
 bot = telebot.TeleBot(TOKEN, threaded=True)
 app = Flask(__name__)
 
