@@ -1,7 +1,7 @@
-ccxt
+pyTelegramBotAPI
+flask
+requests
 pandas
 pandas-ta
+ccxt
 matplotlib
-pyTelegramBotAPI
-Flask
-gunicorn
