@@ -1,40 +1,28 @@
-import os
-import time
-import threading
-from datetime import datetime, timezone
+@bot.message_handler(commands=["start"])
+def start_cmd(message):
+    global USER_CHAT_ID
+    USER_CHAT_ID = message.chat.id
 
-import pandas as pd
-import pandas_ta as ta
-import ccxt
-import matplotlib
-matplotlib.use("Agg")  # backend non-GUI untuk server
-import matplotlib.pyplot as plt
+    # === BUAT KEYBOARD MENU ===
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    btn_crypto = types.KeyboardButton("CRYPTO")
+    btn_chart = types.KeyboardButton("Chart")
+    kb.row(btn_crypto, btn_chart)
 
-import telebot
-from flask import Flask
-
-# =========================
-#  CONFIG & SETUP
-# =========================
-
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    raise ValueError("TOKEN Telegram belum diset. Tambahkan di Replit Secrets dengan nama 'TOKEN'.")
-
-bot = telebot.TeleBot(TOKEN)
-
-# Chat ID user yang aktif (/start)
-USER_CHAT_ID = None
-
-# Web server mini untuk keep-alive di Replit
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Crypto MACD Signal Bot is running!"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
+    text = (
+        "👋 *Crypto MACD Signal Bot*\n\n"
+        "Bot ini:\n"
+        "1️⃣ *Auto-signal MACD* 12,26,9 untuk:\n"
+        f"   Pair: {', '.join(CRYPTO_PAIRS)}\n"
+        f"   TF  : {', '.join(CRYPTO_TIMEFRAMES)}\n\n"
+        "2️⃣ *Fitur chart cepat* via tombol *Chart*:\n"
+        "   - Tekan tombol `Chart`\n"
+        "   - Lalu ketik: `BTCUSDT 1h` atau `ETHUSDT 4h`\n\n"
+        "Timeframe yang didukung (Binance/ccxt):\n"
+        "`1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M`\n\n"
+        "Sinyal BUY/SELL akan otomatis dikirim ke chat ini."
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=kb)    app.run(host="0.0.0.0", port=8080)
 
 # =========================
 #  CRYPTO CONFIG (Binance via ccxt)
