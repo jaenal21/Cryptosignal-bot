@@ -1,13 +1,273 @@
+import os
+import threading
+import time
+from datetime import datetime, timezone
+
+import ccxt
+import matplotlib
+matplotlib.use("Agg")  # backend non-GUI untuk server
+import matplotlib.pyplot as plt
+import pandas as pd
+import pandas_ta as ta
+from flask import Flask, request
+
+import telebot
+from telebot import types
+
+# =========================
+#  CONFIG ENV
+# =========================
+# Wajib kamu set di Render:
+#  - TELEGRAM_TOKEN
+#  - WEBHOOK_HOST (misal: https://nama-service.onrender.com)
+#  - OPTIONAL: WEBHOOK_PATH (kalau mau custom, default /webhook/<TOKEN>)
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("Env TELEGRAM_TOKEN belum di-set.")
+
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+if not WEBHOOK_HOST:
+    raise ValueError("Env WEBHOOK_HOST belum di-set. Contoh: https://nama-service.onrender.com")
+
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/webhook/{TOKEN}")
+WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
+
+PORT = int(os.environ.get("PORT", 8080))  # Render akan isi PORT
+
+bot = telebot.TeleBot(TOKEN, threaded=True)
+app = Flask(__name__)
+
+# Chat ID user yang aktif (bisa banyak, simpan sebagai set)
+ACTIVE_CHAT_IDS = set()
+
+# =========================
+#  CRYPTO CONFIG
+# =========================
+
+EXCHANGE_NAME = "Binance"
+exchange = ccxt.binance()
+
+CRYPTO_PAIRS = [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "PAXG/USDT",
+    "XRP/USDT",
+    "DOT/USDT",
+]
+
+CRYPTO_TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
+
+# Simpan sinyal terakhir: (symbol, tf) -> "BUY"/"SELL"
+LAST_SIGNAL = {}
+
+
+# =========================
+#  UTIL
+# =========================
+
+def format_time_utc(ts=None):
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+    return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def send_to_all_active(text: str):
+    for chat_id in list(ACTIVE_CHAT_IDS):
+        try:
+            bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception:
+            # kalau error (user blokir bot, dll) – hapus dari list
+            ACTIVE_CHAT_IDS.discard(chat_id)
+
+
+# =========================
+#  DATA CRYPTO / MACD
+# =========================
+
+def get_ohlcv_ccxt(symbol: str, timeframe: str, limit: int = 200):
+    for attempt in range(2):
+        try:
+            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except ccxt.NetworkError:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return None
+        except ccxt.ExchangeError:
+            return None
+
+
+def macd_from_ohlc(ohlc):
+    if not ohlc or len(ohlc) < 50:
+        return None
+
+    df = pd.DataFrame(
+        ohlc,
+        columns=["time", "open", "high", "low", "close", "volume"],
+    )
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+
+    macd_df = ta.macd(df["close"])
+    if macd_df is None or macd_df.empty:
+        return None
+
+    macd_col = "MACD_12_26_9"
+    macds_col = "MACDs_12_26_9"
+    macdh_col = "MACDh_12_26_9"
+
+    if macd_col not in macd_df.columns:
+        return None
+
+    df[macd_col] = macd_df[macd_col]
+    df[macds_col] = macd_df[macds_col]
+    df[macdh_col] = macd_df[macdh_col]
+
+    last = df.iloc[-1]
+    return {
+        "price": float(last["close"]),
+        "macd": float(last[macd_col]),
+        "signal": float(last[macds_col]),
+        "hist": float(last[macdh_col]),
+        "time": last["time"],
+    }
+
+
+def build_signal_message(symbol, tf, res):
+    side = None
+    reason = ""
+
+    if res["macd"] > res["signal"] and res["hist"] > 0:
+        side = "BUY"
+        reason = "MACD Golden Cross, histogram > 0 (bullish momentum)."
+    elif res["macd"] < res["signal"] and res["hist"] < 0:
+        side = "SELL"
+        reason = "MACD Dead Cross, histogram < 0 (bearish momentum)."
+
+    if not side:
+        return None, None
+
+    msg = (
+        f"🚨 *CRYPTO MACD Signal*\n\n"
+        f"Exchange: *{EXCHANGE_NAME}*\n"
+        f"Pair: *{symbol}*\n"
+        f"Timeframe: *{tf}*\n"
+        f"Sinyal: *{side}*\n\n"
+        f"Price: `{res['price']:.5f}`\n"
+        f"MACD: `{res['macd']:.6f}`\n"
+        f"Signal: `{res['signal']:.6f}`\n"
+        f"Histogram: `{res['hist']:.6f}`\n"
+        f"Waktu candle: {res['time']}\n"
+        f"Alasan: {reason}\n"
+        f"Update bot: {format_time_utc()}"
+    )
+    return msg, side
+
+
+# =========================
+#  SCANNER AUTO-SIGNAL
+# =========================
+
+def mark_and_should_send(symbol, tf, side):
+    key = (symbol, tf)
+    last = LAST_SIGNAL.get(key)
+    if last == side:
+        return False
+    LAST_SIGNAL[key] = side
+    return True
+
+
+def crypto_scanner_loop():
+    while True:
+        try:
+            for symbol in CRYPTO_PAIRS:
+                for tf in CRYPTO_TIMEFRAMES:
+                    try:
+                        ohlc = get_ohlcv_ccxt(symbol, tf, limit=200)
+                        if not ohlc:
+                            continue
+
+                        res = macd_from_ohlc(ohlc)
+                        if not res:
+                            continue
+
+                        msg, side = build_signal_message(symbol, tf, res)
+                        if msg and side and mark_and_should_send(symbol, tf, side):
+                            send_to_all_active(msg)
+                    except Exception:
+                        continue
+
+            time.sleep(60)
+        except Exception:
+            time.sleep(60)
+
+
+# =========================
+#  CHART GENERATOR
+# =========================
+
+def plot_chart_with_macd(symbol: str, timeframe: str, limit: int = 200):
+    ohlc = get_ohlcv_ccxt(symbol, timeframe, limit=limit)
+    if not ohlc or len(ohlc) < 50:
+        return None
+
+    df = pd.DataFrame(
+        ohlc,
+        columns=["time", "open", "high", "low", "close", "volume"],
+    )
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+
+    macd_df = ta.macd(df["close"])
+    if macd_df is None or macd_df.empty:
+        return None
+
+    macd_col = "MACD_12_26_9"
+    macds_col = "MACDs_12_26_9"
+    macdh_col = "MACDh_12_26_9"
+
+    if macd_col not in macd_df.columns:
+        return None
+
+    df[macd_col] = macd_df[macd_col]
+    df[macds_col] = macd_df[macds_col]
+    df[macdh_col] = macd_df[macdh_col]
+
+    plt.figure(figsize=(10, 6))
+
+    ax1 = plt.subplot(2, 1, 1)
+    ax1.plot(df["time"], df["close"])
+    ax1.set_title(f"{symbol} - {timeframe} Price")
+    ax1.set_ylabel("Price")
+
+    ax2 = plt.subplot(2, 1, 2)
+    ax2.plot(df["time"], df[macd_col], label="MACD")
+    ax2.plot(df["time"], df[macds_col], label="Signal")
+    ax2.bar(df["time"], df[macdh_col], width=0.01, label="Hist")
+    ax2.set_title("MACD 12,26,9")
+    ax2.legend(loc="best")
+
+    plt.tight_layout()
+
+    filename = f"chart_{symbol.replace('/', '')}_{timeframe}.png"
+    plt.savefig(filename)
+    plt.close()
+
+    return filename
+
+
+# =========================
+#  TELEGRAM HANDLERS
+# =========================
+
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
-    global USER_CHAT_ID
-    USER_CHAT_ID = message.chat.id
+    chat_id = message.chat.id
+    ACTIVE_CHAT_IDS.add(chat_id)
 
-    # === BUAT KEYBOARD MENU ===
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn_crypto = types.KeyboardButton("CRYPTO")
-    btn_chart = types.KeyboardButton("Chart")
-    kb.row(btn_crypto, btn_chart)
+    kb.row(types.KeyboardButton("CRYPTO"), types.KeyboardButton("Chart"))
 
     text = (
         "👋 *Crypto MACD Signal Bot*\n\n"
@@ -22,19 +282,117 @@ def start_cmd(message):
         "`1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1M`\n\n"
         "Sinyal BUY/SELL akan otomatis dikirim ke chat ini."
     )
-    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=kb)    app.run(host="0.0.0.0", port=8080)
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb)
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.upper() == "CRYPTO")
+def crypto_info(message):
+    text = (
+        "📊 *CRYPTO yang dipantau auto-signal:*\n"
+        + "\n".join([f"- {p} @ {', '.join(CRYPTO_TIMEFRAMES)}" for p in CRYPTO_PAIRS])
+        + "\n\nUntuk chart, tekan tombol *Chart* lalu ketik: `BTCUSDT 1h`."
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower() == "chart")
+def chart_menu(message):
+    text = (
+        "🧾 *Mode Chart Manual*\n\n"
+        "Silakan ketik pair + timeframe dengan format:\n"
+        "`BTCUSDT 1h`\n"
+        "`ETHUSDT 4h`\n"
+        "`XRPUSDT 30m`\n"
+        "`PAXGUSDT 1d`\n\n"
+        "Aturan:\n"
+        "- Symbol: pakai format Binance (BTCUSDT, ETHUSDT, XRPUSDT, DOTUSDT, dll)\n"
+        "- Timeframe: 1m,5m,15m,30m,1h,4h,1d, dll.\n"
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda m: True)
+def generic_text_handler(message):
+    text = message.text.strip().upper()
+
+    if text in ["CRYPTO", "CHART", "/START"]:
+        return
+
+    parts = text.split()
+    if len(parts) != 2:
+        return
+
+    symbol_raw, tf = parts[0], parts[1]
+
+    if symbol_raw.endswith("USDT"):
+        base = symbol_raw.replace("USDT", "")
+        symbol = f"{base}/USDT"
+    else:
+        symbol = symbol_raw
+
+    try:
+        bot.reply_to(message, f"⏳ Mengambil chart {symbol} timeframe {tf} dari {EXCHANGE_NAME}...")
+
+        file_path = plot_chart_with_macd(symbol, tf)
+        if not file_path:
+            bot.reply_to(
+                message,
+                "Gagal membuat chart. Coba cek lagi symbol/timeframenya.\n"
+                "Contoh: `BTCUSDT 1h`",
+                parse_mode="Markdown",
+            )
+            return
+
+        with open(file_path, "rb") as photo:
+            caption = f"{symbol} - {tf} (Price + MACD)"
+            bot.send_photo(message.chat.id, photo, caption=caption)
+    except Exception as e:
+        bot.reply_to(message, f"Error saat membuat chart: `{e}`", parse_mode="Markdown")
+
 
 # =========================
-#  CRYPTO CONFIG (Binance via ccxt)
+#  FLASK + WEBHOOK
 # =========================
 
-EXCHANGE_NAME = "Binance"
-exchange = ccxt.binance()  # tanpa API key, public market data
+@app.route("/", methods=["GET"])
+def index():
+    return "Crypto MACD Signal Bot - OK"
 
-# Pair crypto yang akan dipantau auto-signal
-CRYPTO_PAIRS = [
-    "BTC/USDT",
-    "ETH/USDT",
+
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_str = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+        return "OK", 200
+    else:
+        return "Unsupported Media Type", 415
+
+
+def set_webhook():
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=WEBHOOK_URL)
+
+
+# =========================
+#  MAIN
+# =========================
+
+if __name__ == "__main__":
+    print("Starting Crypto MACD Bot (Render/webhook mode)...")
+    print("Webhook URL:", WEBHOOK_URL)
+
+    # set webhook Telegram
+    set_webhook()
+
+    # start scanner auto-signal di thread terpisah
+    t_scan = threading.Thread(target=crypto_scanner_loop, daemon=True)
+    t_scan.start()
+
+    # jalankan Flask (Render akan call gunicorn / python main.py)
+    app.run(host="0.0.0.0", port=PORT)    "ETH/USDT",
     "SOL/USDT",
     "BNB/USDT",
     "PAXG/USDT",
